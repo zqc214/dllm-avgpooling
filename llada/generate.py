@@ -24,6 +24,11 @@ from model.modeling_llada import LLaDAModelLM
 
 from torch.cuda import nvtx
 
+
+
+
+
+
 def add_gumbel_noise(logits, temperature):
     '''
     The Gumbel max is a method for sampling categorical distributions.
@@ -79,6 +84,101 @@ def get_num_transfer_tokens(block_mask_index: torch.Tensor, steps: int) -> torch
     num_transfer_tokens = num_transfer_tokens + add_mask.to(dtype)       # (B, steps)
 
     return num_transfer_tokens
+
+
+
+
+
+
+
+def get_keep_indices_by_avgpool(key_states, keep_ratio, kernel_size=3):
+    """
+    对给定的 Key 片段进行 AvgPool 打分并返回保留索引。
+    key_states: (Batch, Num_Heads, Seq_Len, Head_Dim)
+    """
+    if key_states.shape[2] == 0:
+        return torch.empty(key_states.shape[0], 0, device=key_states.device, dtype=torch.long)
+
+    # 1. 预处理：聚合多头，转为 (B, D, L) 以适配 AvgPool
+    # 我们认为一个 Token 所有头的平均能量代表其重要性
+    # (B, H, L, D) -> mean(1) -> (B, L, D) -> permute -> (B, D, L)
+    x = key_states.mean(dim=1).permute(0, 2, 1) 
+    
+    # 2. 平均池化 (Stride=1, Padding保持长度不变)
+    pad = kernel_size // 2
+    # x_low即为低频信号
+    x_low = F.avg_pool1d(x, kernel_size=kernel_size, stride=1, padding=pad, count_include_pad=False)
+    
+    # 3. 计算低频能量 (L2 Norm) -> (B, L)
+    # 还原维度 (B, D, L) -> (B, L, D)
+    x_low = x_low.permute(0, 2, 1)
+    scores = torch.norm(x_low, p=2, dim=-1)
+    
+    # 4. Top-K 筛选
+    L = key_states.shape[2]
+    k_keep = max(1, int(L * keep_ratio)) # 至少保留1个，防止报错
+    
+    _, indices = torch.topk(scores, k=k_keep, dim=1)
+    
+    # 5. 必须排序！
+    # 因为 Key 已经包含了 RoPE 信息，乱序会破坏相对位置编码的有效性
+    indices, _ = torch.sort(indices, dim=1)
+    
+    return indices
+
+def prune_dual_kv_cache(past_key_values, current_start, current_end, prefix_ratio=0.5, suffix_ratio=0.5):
+    """
+    对 Dual Cache 进行分区剪枝。
+    """
+    # 1. 使用中间层来计算分数 (避免每层都算一遍，节省时间)
+    layer_idx = len(past_key_values) // 2
+    sample_key = past_key_values[layer_idx][0] # (B, H, Total_Len, D)
+    
+    B, H, Total_Len, D = sample_key.shape
+    device = sample_key.device
+    
+    # 2. 切分区域
+    # [Prefix: 0~s] | [Current: s~e] | [Suffix: e~end]
+    prefix_keys = sample_key[:, :, :current_start, :]
+    suffix_keys = sample_key[:, :, current_end:, :]
+    
+    # 3. 分别计算保留索引
+    # 注意：返回的 indices 是相对坐标，需要加上偏移量
+    prefix_indices = get_keep_indices_by_avgpool(prefix_keys, prefix_ratio) # 范围 [0, s)
+    suffix_indices = get_keep_indices_by_avgpool(suffix_keys, suffix_ratio) # 范围 [0, end-e)
+    
+    # 加上偏移量，转换成全局坐标
+    suffix_indices = suffix_indices + current_end 
+    
+    # 4. 构建当前 Block 的全量索引 (必须保留)
+    # (B, Block_Len)
+    current_indices = torch.arange(current_start, current_end, device=device).unsqueeze(0).expand(B, -1)
+    
+    # 5. 拼接全局索引
+    # Final = [Keep_Prefix, Full_Current, Keep_Suffix]
+    global_indices = torch.cat([prefix_indices, current_indices, suffix_indices], dim=1)
+    # 再次排序确保整体有序 (其实拼接是有序的，但为了保险)
+    global_indices, _ = torch.sort(global_indices, dim=1)
+    
+    # 6. 对所有层执行物理剪枝
+    new_past_key_values = []
+    
+    # 准备 gather 的 index
+    # (B, Global_Len) -> (B, H, Global_Len, D)
+    gather_idx = global_indices.unsqueeze(1).unsqueeze(-1).expand(B, H, global_indices.shape[1], D)
+    
+    for layer in past_key_values:
+        k, v = layer # (B, H, L, D)
+        
+        k_pruned = torch.gather(k, 2, gather_idx)
+        v_pruned = torch.gather(v, 2, gather_idx)
+        
+        new_past_key_values.append((k_pruned, v_pruned))
+        
+    return tuple(new_past_key_values)
+
+
+
 
 
 
@@ -210,7 +310,8 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
 @torch.no_grad()
 def generate_with_dual_cache(
     model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-    remasking="low_confidence", mask_id=126336, threshold=None, factor=None
+    remasking="low_confidence", mask_id=126336, threshold=None, factor=None,
+    prefix_keep_ratio=0.5, suffix_keep_ratio=0.5
 ):
     B = prompt.shape[0]
     Lp = int(prompt.shape[1])  # Python int, not Tensor
@@ -226,6 +327,14 @@ def generate_with_dual_cache(
 
     nfe = 0
 
+    # [新增] 初始化全局计时累加器 (单位: 毫秒)
+    total_prune_time = 0.0
+    total_model_time = 0.0
+    
+    # [新增] 创建 Event 对象
+    t0 = torch.cuda.Event(enable_timing=True)
+    t1 = torch.cuda.Event(enable_timing=True)
+
     for nb in range(num_blocks):
         s = Lp + nb * block_length
         e = s + block_length
@@ -234,10 +343,65 @@ def generate_with_dual_cache(
         block_mask_index = (x[:, s:e] == mask_id)  # (B, block_length)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)  # (B, steps_per_block)
 
+        # ============================================================
+        # [修改] 测量主要的模型推理时间 (Block Warmup)
+        # 这通常是计算量最大的一步，也是享受上一轮剪枝红利的地方
+        # ============================================================
+        t0.record()
+
         # 1) Warm KV-cache on the full prefix once per block
         out_full = model(x, use_cache=True)
+        
+        t1.record()
+        torch.cuda.synchronize()
+        total_model_time += t0.elapsed_time(t1)
+        
         past_key_values = out_full.past_key_values
         nfe += 1
+
+        # ============================================================
+        # 1. 在剪枝前：获取并打印原始形状
+        # ============================================================
+        # 我们只在主进程 (Rank 0) 且第 0 个 Block 打印，避免刷屏
+        if nb == 0 and int(os.environ.get("RANK", 0)) == 0:
+            # 获取形状并赋值给变量
+            shape_before = past_key_values[0][0].shape 
+            print(f"[DEBUG] Block {nb} Before Pruning: {shape_before}")
+
+        # ============================================================
+        # [修改] Token Pruning 逻辑与计时
+        # ============================================================
+        # 只有当有东西可以剪的时候才执行
+        if past_key_values[0][0].shape[2] > block_length:
+
+            t0.record() # 开始计时
+            
+            past_key_values = prune_dual_kv_cache(
+                past_key_values, 
+                current_start=s, 
+                current_end=e, 
+                prefix_ratio=prefix_keep_ratio, 
+                suffix_ratio=suffix_keep_ratio
+            )
+
+            t1.record() # 结束计时
+            torch.cuda.synchronize() # 等待 GPU 执行完
+            total_prune_time += t0.elapsed_time(t1) # 累加时间
+
+            # ============================================================
+            # 3. 在剪枝后：获取并打印新形状 (移入 if 内部)
+            # ============================================================
+            if nb == 0 and int(os.environ.get("RANK", 0)) == 0:
+                # 获取新的形状
+                shape_after = past_key_values[0][0].shape
+                print(f"[DEBUG] Block {nb} After  Pruning: {shape_after}")
+                
+                # 计算剪掉了多少
+                reduced = shape_before[2] - shape_after[2]
+                print(f"[DEBUG] Pruned {reduced} tokens in total.")
+             
+        # [修改结束] 此时 past_key_values 的长度变短了 (物理减少显存)
+        # ============================================================
 
         # Build a replace_position tensor indicating the block range (static slice)
         replace_position = torch.zeros_like(x, dtype=torch.bool)
@@ -267,9 +431,19 @@ def generate_with_dual_cache(
             # Evaluate logits only for current block with cache
             if (x[:, s:e] == mask_id).sum() == 0:
                 break
+
+            # ============================================================
+            # [修改] 测量 Refinement Loop 中的模型推理时间
+            # ============================================================
+            t0.record() # 开始计时
+
             logits_blk = model(
                 x[:, s:e], past_key_values=past_key_values, use_cache=True, replace_position=replace_position
             ).logits  # shape expected by get_transfer_index*
+
+            t1.record() # 结束计时
+            torch.cuda.synchronize()
+            total_model_time += t0.elapsed_time(t1)
 
             # Mask and quota for this step (all tensor ops)
             mask_blk = (x[:, s:e] == mask_id)  # (B, block_length)
@@ -291,7 +465,18 @@ def generate_with_dual_cache(
 
             nfe += 1
 
+    # [新增] 在函数返回前打印统计信息
+    # 只在主进程打印，且打印一次即可
+    if int(os.environ.get("RANK", 0)) == 0:
+        print(f"\n[Performance Profile]")
+        print(f"Total Pruning Time: {total_prune_time:.2f} ms")
+        print(f"Total Model   Time: {total_model_time:.2f} ms")
+        if total_model_time > 0:
+            ratio = (total_prune_time / total_model_time) * 100
+            print(f"Pruning Overhead: {ratio:.2f}% relative to Inference")
+
     return x, nfe
+
 
 
 
