@@ -126,56 +126,50 @@ def get_keep_indices_by_avgpool(key_states, keep_ratio, kernel_size=3):
     
     return indices
 
+# llada/generate.py
+
 def prune_dual_kv_cache(past_key_values, current_start, current_end, prefix_ratio=0.5, suffix_ratio=0.5):
     """
-    对 Dual Cache 进行分区剪枝。
+    对 Dual Cache 进行分区剪枝，并剔除 Current Block。
     """
-    # 1. 使用中间层来计算分数 (避免每层都算一遍，节省时间)
     layer_idx = len(past_key_values) // 2
     sample_key = past_key_values[layer_idx][0] # (B, H, Total_Len, D)
     
     B, H, Total_Len, D = sample_key.shape
     device = sample_key.device
     
-    # 2. 切分区域
     # [Prefix: 0~s] | [Current: s~e] | [Suffix: e~end]
     prefix_keys = sample_key[:, :, :current_start, :]
     suffix_keys = sample_key[:, :, current_end:, :]
     
-    # 3. 分别计算保留索引
-    # 注意：返回的 indices 是相对坐标，需要加上偏移量
-    prefix_indices = get_keep_indices_by_avgpool(prefix_keys, prefix_ratio) # 范围 [0, s)
-    suffix_indices = get_keep_indices_by_avgpool(suffix_keys, suffix_ratio) # 范围 [0, end-e)
+    # 分别计算保留索引
+    prefix_indices = get_keep_indices_by_avgpool(prefix_keys, prefix_ratio) 
+    suffix_indices = get_keep_indices_by_avgpool(suffix_keys, suffix_ratio)
     
     # 加上偏移量，转换成全局坐标
     suffix_indices = suffix_indices + current_end 
     
-    # 4. 构建当前 Block 的全量索引 (必须保留)
-    # (B, Block_Len)
-    current_indices = torch.arange(current_start, current_end, device=device).unsqueeze(0).expand(B, -1)
+    # --- [关键修改] 移除 Current Block 的索引 ---
+    # 我们不再生成 current_indices，也不将其拼接到 global_indices 中
     
-    # 5. 拼接全局索引
-    # Final = [Keep_Prefix, Full_Current, Keep_Suffix]
-    global_indices = torch.cat([prefix_indices, current_indices, suffix_indices], dim=1)
-    # 再次排序确保整体有序 (其实拼接是有序的，但为了保险)
+    # Final = [Keep_Prefix, Keep_Suffix]
+    global_indices = torch.cat([prefix_indices, suffix_indices], dim=1)
+    
+    # 排序确保有序
     global_indices, _ = torch.sort(global_indices, dim=1)
     
-    # 6. 对所有层执行物理剪枝
+    # 执行物理剪枝
     new_past_key_values = []
-    
-    # 准备 gather 的 index
-    # (B, Global_Len) -> (B, H, Global_Len, D)
     gather_idx = global_indices.unsqueeze(1).unsqueeze(-1).expand(B, H, global_indices.shape[1], D)
     
     for layer in past_key_values:
-        k, v = layer # (B, H, L, D)
-        
+        k, v = layer 
         k_pruned = torch.gather(k, 2, gather_idx)
         v_pruned = torch.gather(v, 2, gather_idx)
-        
         new_past_key_values.append((k_pruned, v_pruned))
         
     return tuple(new_past_key_values)
+
 
 
 

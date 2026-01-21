@@ -90,7 +90,7 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-@torch.compile()
+# @torch.compile()
 def scaled_dot_product_attention(q, k, v, mask=None, attn_mask=None, dropout_p=0.0, is_causal=False):
     return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
 
@@ -433,7 +433,7 @@ class RotaryEmbedding(nn.Module):
         return ((t * pos_cos) + (self.rotate_half(t) * pos_sin)).to(t.dtype)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor,
-                block_end_index: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+                block_end_index: Optional[Union[int, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.config.rope_full_precision:
             q_, k_ = q.float(), k.float()
         else:
@@ -441,30 +441,67 @@ class RotaryEmbedding(nn.Module):
 
         with torch.autocast(q.device.type, enabled=False):
             query_len, key_len = q_.shape[-2], k_.shape[-2]
-            pos_sin, pos_cos = self.get_rotary_embedding(key_len, q_.device)
+            
+            # --- 修复 1: 确保 RoPE 缓存足够长 ---
+            if block_end_index is not None:
+                # 无论传入是 int 还是 Tensor，都转为 int 处理
+                if isinstance(block_end_index, torch.Tensor):
+                    max_end_idx = block_end_index.max().item()
+                else:
+                    max_end_idx = block_end_index
+                
+                # 缓存长度必须覆盖我们要访问的最大索引
+                required_len = max_end_idx
+            else:
+                # 全量模式：长度就是序列长度
+                required_len = max(query_len, key_len)
+
+            # 调用 get_rotary_embedding 进行扩容
+            pos_sin, pos_cos = self.get_rotary_embedding(required_len, q_.device)
+            
+            # [调试打印] 如果你不放心，可以保留这行，确认 required_len 确实很大(如 200+)，而不是 32
+            # if block_end_index is not None and required_len < 100:
+            #     print(f"[DEBUG RoPE] Warning: required_len={required_len} seems small for generation?")
+
             pos_sin = pos_sin.type_as(q_)
             pos_cos = pos_cos.type_as(q_)
 
-            # Build tensor indices instead of using .item()
+            # --- 准备索引 ---
             if block_end_index is None:
                 start = key_len - query_len
                 end = key_len
             else:
-                # block_end_index is a tensor; keep ops tensor-based
-                start = (block_end_index - query_len)
-                end = block_end_index
+                # 这里的 max_end_idx 已经是 int 了
+                start = max_end_idx - query_len
+                end = max_end_idx
 
-            # Make an index tensor [start, ..., end-1] on the right device/dtype
             idx = torch.arange(start, end, device=q_.device, dtype=torch.long)
-
-            # Use index_select on the sequence dimension (dim=2)
+            
+            # 切片出当前时间步的旋转角度
             pos_sin_slice = pos_sin.index_select(2, idx)
             pos_cos_slice = pos_cos.index_select(2, idx)
 
+            # --- 应用旋转 ---
             q_ = self.apply_rotary_pos_emb(pos_sin_slice, pos_cos_slice, q_)
-            k_ = self.apply_rotary_pos_emb(pos_sin, pos_cos, k_)
+            
+            # --- 修复 2: K 的旋转逻辑 ---
+            if block_end_index is not None:
+                # 生成模式：K 和 Q 都是 Current Block，时间步相同
+                # 必须使用相同的切片 (pos_sin_slice)！
+                # 原代码这里用了 pos_sin (从0开始)，是错的
+                k_ = self.apply_rotary_pos_emb(pos_sin_slice, pos_cos_slice, k_)
+            else:
+                # 全量模式：K 是全长，Q 是后半段
+                # K 需要使用完整的前缀位置编码 (从0到end)
+                # 注意：这里的 pos_sin 长度是 required_len，可能比 key_len 长，需要切片
+                k_ = self.apply_rotary_pos_emb(
+                    pos_sin[:, :, :key_len, :], 
+                    pos_cos[:, :, :key_len, :], 
+                    k_
+                )
 
         return q_.type_as(q), k_.type_as(k)
+
 
 
 
@@ -710,84 +747,81 @@ class LLaDABlock(nn.Module):
         use_cache: bool = False,
         replace_position: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        B, T, C = q.size()  # batch size, sequence length, d_model
+        B, T, C = q.size()
         dtype = k.dtype
 
-        # Optionally apply layer norm to keys and queries.
-        if self.q_norm is not None and self.k_norm is not None: #self.q_norm: None, self.k_norm: None
+        # 1. Norm
+        if self.q_norm is not None and self.k_norm is not None:
             q = self.q_norm(q).to(dtype=dtype)
             k = self.k_norm(k).to(dtype=dtype)
 
-        # Move head forward to be next to the batch dim.
-        # shape: (B, nh, T, hs)
-        # self.config.n_heads: 32
+        # 2. Reshape Heads
         q = q.view(B, T, self.config.n_heads, C // self.config.n_heads).transpose(1, 2)
-        # shape: (B, n_kv_h, T, hs)
         k = k.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
-        # shape: (B, n_kv_h, T, hs)
         v = v.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
 
-        if layer_past is not None: 
-            past_key, past_value = layer_past
-            if replace_position is None:
-                k = torch.cat((past_key, k), dim=-2)
-                v = torch.cat((past_value, v), dim=-2)
-            else:
-                # k shape is [B, n_kv_h, selected_length, hs]
-                # replace_position shape is [B, L], where L contains 0s and 1s, 0 means no replacement, 1 means replace, with selected_length number of 1s
-                # past_key shape is [B, n_kv_h, L, hs]
-                # Replace selected_length number of 1s in past_key with k
-                
-                # Handle batched replace_position correctly
-                B = replace_position.shape[0]
-                for batch_idx in range(B):
-                    # Get indices for this batch
-                    batch_replace_indices = replace_position[batch_idx].nonzero(as_tuple=True)[0]
-                    if len(batch_replace_indices) > 0:
-                        # Replace positions in past_key and past_value for this batch
-                        past_key[batch_idx, :, batch_replace_indices] = k[batch_idx, :, :len(batch_replace_indices)]
-                        past_value[batch_idx, :, batch_replace_indices] = v[batch_idx, :, :len(batch_replace_indices)]
-                
-                k = past_key
-                v = past_value
-
-        present = (k, v) if use_cache else None #present: None
-        query_len, key_len = q.shape[-2], k.shape[-2]  # could be different if layer_past not None
-
+        # --- 核心修正区 ---
+        
+        # 3. 对 Current Block (q, k) 应用 RoPE
         if self.config.rope:
-            # Apply rotary embeddings.
             if replace_position is None:
+                # 全量模式 (Step 0, 1): 从 0 开始旋转
                 q, k = self.rotary_emb(q, k)
             else:
-                # For batched replace_position, use the maximum position across all batches
-                max_replace_pos = replace_position.nonzero(as_tuple=True)[1].max() + 1 if replace_position.any() else key_len
-                q, k = self.rotary_emb(q, k, max_replace_pos)
+                # 生成模式 (Step 2+): 带 Offset 旋转
+                # 找到当前 Block 的结束位置 (绝对坐标)
+                
+                # --- [关键修改点] 加上 .item() ---
+                # 确保 block_start_index 是一个 Python 整数，而不是 Tensor
+                block_start_index = replace_position.nonzero(as_tuple=True)[1].min().item()
+                
+                block_end_index = block_start_index + q.shape[-2]
+                
+                # 对当前的 q 和 k 应用旋转
+                # 此时传入的 block_end_index 已经是 int 类型，可以直接在 RotaryEmbedding 中使用
+                q, k = self.rotary_emb(q, k, block_end_index=block_end_index)
+
+        # 4. 准备返回值 (present)
+        current_k = k
+        current_v = v
+        present = (current_k, current_v) if use_cache else None
+
+        # 5. 拼接 Cache
+        if layer_past is not None:
+            past_key, past_value = layer_past
+            k = torch.cat([past_key, current_k], dim=-2)
+            v = torch.cat([past_value, current_v], dim=-2)
+
+        # --- 修正结束 ---
+        
+        # 6. 处理 Attention Bias
+        query_len = q.shape[-2]
+        key_len = k.shape[-2]
 
         if attention_bias is not None:
-            # Resize and cast attention bias.
-            # The current dtype of the attention bias might not match the dtype that the SDP attn function will
-            # run in if AMP is enabled, and this can be a problem if some tokens are masked out due to padding
-            # as down-casting the attention bias to the autocast precision will result in -infs, which will
-            # cause the SDP attn function to produce NaNs.
-            attention_bias = self._cast_attn_bias(
-                attention_bias[:, :, key_len - query_len : key_len, :key_len], dtype
-            )
+            # 如果是在生成模式(replace_position不为空)，此时 K 是非连续的（中间被挖空了）
+            # 原始的 attention_bias (通常是全量 Mask) 可能会导致形状不匹配或越界
+            # 建议：如果是生成模式，且模型不需要 Causal Mask (双向)，可以直接设为 None
+            if replace_position is not None:
+                 attention_bias = None 
+            else:
+                 # 全量模式下保留原有逻辑
+                 attention_bias = self._cast_attn_bias(
+                    attention_bias[:, :, key_len - query_len : key_len, :key_len], dtype
+                 )
 
-        # Get the attention scores.
-        # shape: (B, nh, T, hs)
+        # 7. Attention 计算
         att = self._scaled_dot_product_attention(
-            q,
-            k,
-            v,
+            q, k, v,
             attn_mask=None,
             dropout_p=0.0 if not self.training else self.config.attention_dropout,
             is_causal=False,
         )
-        # Re-assemble all head outputs side-by-side.
+        
         att = att.transpose(1, 2).contiguous().view(B, T, C)
-
-        # Apply output projection.
         return self.attn_out(att), present
+
+
 
 
     @abstractmethod
